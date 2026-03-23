@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.parse
 
 import cairosvg
 import qrcode
@@ -68,6 +69,19 @@ QR_TYPES = ["URL / Text", "WiFi", "Contact", "Email", "SMS", "Phone"]
 
 PRESETS_DIR = os.path.expanduser("~/.qrbuilder/presets")
 
+DEFAULT_SETTINGS = {
+    "qr_type": "URL / Text", "url": "",
+    "wifi_ssid": "", "wifi_pass": "", "wifi_sec": "WPA",
+    "contact_name": "", "contact_phone": "", "contact_email": "",
+    "email_to": "", "email_subject": "", "email_body": "",
+    "sms_number": "", "sms_body": "", "phone": "",
+    "ec": "Q", "shape": "Square",
+    "bg": "#FFFFFF", "fg": "#000000", "fg2": "#0055FF",
+    "gradient": "None", "eye_shape": "Square", "eye_color": "#000000",
+    "border": 4, "logo_size": 25, "logo_pad": 8,
+    "logo_path": "", "bg_image_path": "", "bg_opacity": 30,
+}
+
 BOX_SIZE = 10
 PREVIEW_SIZE = 420
 
@@ -89,47 +103,51 @@ class QRBuilderApp(tk.Tk):
         self._logo_path: str | None = None
         self._bg_image_path: str | None = None
         self._generation_id = 0
+        self._generation_lock = threading.Lock()
         self._wifi_warn_shown = False
+        self._logo_cache: tuple | None = None    # (path, max_px, Image)
+        self._bg_cache:   tuple | None = None    # (path, Image)
 
+        d = DEFAULT_SETTINGS
         # ── Content vars ──────────────────────────────────────────────────
-        self.qr_type_var = tk.StringVar(value="URL / Text")
-        self.url_var = tk.StringVar()
+        self.qr_type_var = tk.StringVar(value=d["qr_type"])
+        self.url_var = tk.StringVar(value=d["url"])
         # WiFi
-        self.wifi_ssid_var = tk.StringVar()
-        self.wifi_pass_var = tk.StringVar()
-        self.wifi_sec_var = tk.StringVar(value="WPA")
+        self.wifi_ssid_var = tk.StringVar(value=d["wifi_ssid"])
+        self.wifi_pass_var = tk.StringVar(value=d["wifi_pass"])
+        self.wifi_sec_var = tk.StringVar(value=d["wifi_sec"])
         # Contact (MECARD)
-        self.contact_name_var = tk.StringVar()
-        self.contact_phone_var = tk.StringVar()
-        self.contact_email_var = tk.StringVar()
+        self.contact_name_var = tk.StringVar(value=d["contact_name"])
+        self.contact_phone_var = tk.StringVar(value=d["contact_phone"])
+        self.contact_email_var = tk.StringVar(value=d["contact_email"])
         # Email
-        self.email_to_var = tk.StringVar()
-        self.email_subject_var = tk.StringVar()
-        self.email_body_var = tk.StringVar()
+        self.email_to_var = tk.StringVar(value=d["email_to"])
+        self.email_subject_var = tk.StringVar(value=d["email_subject"])
+        self.email_body_var = tk.StringVar(value=d["email_body"])
         # SMS
-        self.sms_number_var = tk.StringVar()
-        self.sms_body_var = tk.StringVar()
+        self.sms_number_var = tk.StringVar(value=d["sms_number"])
+        self.sms_body_var = tk.StringVar(value=d["sms_body"])
         # Phone
-        self.phone_var = tk.StringVar()
+        self.phone_var = tk.StringVar(value=d["phone"])
 
         # ── Style vars ────────────────────────────────────────────────────
-        self.ec_var = tk.StringVar(value="Q")
-        self.shape_var = tk.StringVar(value="Square")
-        self.bg_var = tk.StringVar(value="#FFFFFF")
-        self.fg_var = tk.StringVar(value="#000000")
-        self.border_var = tk.IntVar(value=4)
+        self.ec_var = tk.StringVar(value=d["ec"])
+        self.shape_var = tk.StringVar(value=d["shape"])
+        self.bg_var = tk.StringVar(value=d["bg"])
+        self.fg_var = tk.StringVar(value=d["fg"])
+        self.border_var = tk.IntVar(value=d["border"])
         # Gradient
-        self.gradient_var = tk.StringVar(value="None")
-        self.fg2_var = tk.StringVar(value="#0055FF")
+        self.gradient_var = tk.StringVar(value=d["gradient"])
+        self.fg2_var = tk.StringVar(value=d["fg2"])
         # Eyes
-        self.eye_shape_var = tk.StringVar(value="Square")
-        self.eye_color_var = tk.StringVar(value="#000000")
+        self.eye_shape_var = tk.StringVar(value=d["eye_shape"])
+        self.eye_color_var = tk.StringVar(value=d["eye_color"])
         # Background image
-        self.bg_opacity_var = tk.IntVar(value=30)
+        self.bg_opacity_var = tk.IntVar(value=d["bg_opacity"])
 
         # ── Logo vars ─────────────────────────────────────────────────────
-        self.logo_size_var = tk.IntVar(value=25)
-        self.logo_pad_var = tk.IntVar(value=8)
+        self.logo_size_var = tk.IntVar(value=d["logo_size"])
+        self.logo_pad_var = tk.IntVar(value=d["logo_pad"])
 
         self._build_ui()
         self._bind_events()
@@ -293,27 +311,39 @@ class QRBuilderApp(tk.Tk):
                 row=1, column=0, columnspan=2, sticky="ew", **pad
             )
 
+    @staticmethod
+    def _escape_wifi(value: str) -> str:
+        """Escape special characters in WIFI QR format values (RFC 4180-style)."""
+        return re.sub(r'([\\;,":{}])', r'\\\1', value)
+
+    @staticmethod
+    def _escape_mecard(value: str) -> str:
+        """Escape special characters in MECARD format values."""
+        return re.sub(r'([\\;:"])', r'\\\1', value)
+
     def _build_content_string(self) -> str:
         t = self.qr_type_var.get()
         if t == "URL / Text":
             return self.url_var.get().strip() or "https://example.com"
         elif t == "WiFi":
-            ssid = self.wifi_ssid_var.get()
-            pw   = self.wifi_pass_var.get()
+            ssid = self._escape_wifi(self.wifi_ssid_var.get())
+            pw   = self._escape_wifi(self.wifi_pass_var.get())
             sec  = self.wifi_sec_var.get()
             return f"WIFI:T:{sec};S:{ssid};P:{pw};;"
         elif t == "Contact":
-            n = self.contact_name_var.get()
-            p = self.contact_phone_var.get()
-            e = self.contact_email_var.get()
+            n = self._escape_mecard(self.contact_name_var.get())
+            p = self._escape_mecard(self.contact_phone_var.get())
+            e = self._escape_mecard(self.contact_email_var.get())
             return f"MECARD:N:{n};TEL:{p};EMAIL:{e};;"
         elif t == "Email":
             to   = self.email_to_var.get()
-            subj = self.email_subject_var.get()
-            body = self.email_body_var.get()
+            subj = urllib.parse.quote(self.email_subject_var.get())
+            body = urllib.parse.quote(self.email_body_var.get())
             return f"mailto:{to}?subject={subj}&body={body}"
         elif t == "SMS":
-            return f"smsto:{self.sms_number_var.get()}:{self.sms_body_var.get()}"
+            number = self.sms_number_var.get()
+            body   = urllib.parse.quote(self.sms_body_var.get())
+            return f"smsto:{number}:{body}"
         elif t == "Phone":
             return f"tel:{self.phone_var.get()}"
         return "https://example.com"
@@ -662,8 +692,9 @@ class QRBuilderApp(tk.Tk):
         )
         if path:
             self._logo_path = path
+            self._logo_cache = None
             self.logo_label.configure(
-                text=path.split("/")[-1], foreground="black"
+                text=os.path.basename(path), foreground="black"
             )
             if self.ec_var.get() in ("L", "M"):
                 self.ec_var.set("Q")
@@ -676,6 +707,7 @@ class QRBuilderApp(tk.Tk):
 
     def _clear_logo(self):
         self._logo_path = None
+        self._logo_cache = None
         self.logo_label.configure(text="None", foreground="grey")
         self._on_change()
 
@@ -689,13 +721,15 @@ class QRBuilderApp(tk.Tk):
         )
         if path:
             self._bg_image_path = path
+            self._bg_cache = None
             self.bg_image_label.configure(
-                text=path.split("/")[-1], foreground="black"
+                text=os.path.basename(path), foreground="black"
             )
             self._on_change()
 
     def _clear_bg_image(self):
         self._bg_image_path = None
+        self._bg_cache = None
         self.bg_image_label.configure(text="None", foreground="grey")
         self._on_change()
 
@@ -783,25 +817,24 @@ class QRBuilderApp(tk.Tk):
         eye_color_full = eye_rgb[:3] + (255,)
         bg_color_full  = bg_rgb[:3]  + (255,)
 
-        for ox, oy in eye_origins:
-            outer = 7 * bs
-            inner_off = 1 * bs   # 1 module inset
-            gap       = 2 * bs   # white ring thickness (modules 1-5 border)
-            dot_off   = 2 * bs   # 2 modules inset to 3×3 dot
-            dot_size  = 3 * bs
+        def draw_shape(x0, y0, x1, y1, color):
+            if eye_shape == "Square":
+                draw.rectangle([x0, y0, x1, y1], fill=color)
+            elif eye_shape == "Rounded":
+                r = min((x1 - x0), (y1 - y0)) // 4
+                draw.rounded_rectangle([x0, y0, x1, y1], radius=r, fill=color)
+            elif eye_shape == "Circle":
+                draw.ellipse([x0, y0, x1, y1], fill=color)
 
+        outer    = 7 * bs
+        inner_off = 1 * bs
+        dot_off   = 2 * bs
+        dot_size  = 3 * bs
+
+        for ox, oy in eye_origins:
             # 1. Erase the whole 7×7 region
             draw.rectangle([ox, oy, ox + outer - 1, oy + outer - 1],
                            fill=bg_color_full)
-
-            def draw_shape(x0, y0, x1, y1, color):
-                if eye_shape == "Square":
-                    draw.rectangle([x0, y0, x1, y1], fill=color)
-                elif eye_shape == "Rounded":
-                    r = min((x1 - x0), (y1 - y0)) // 4
-                    draw.rounded_rectangle([x0, y0, x1, y1], radius=r, fill=color)
-                elif eye_shape == "Circle":
-                    draw.ellipse([x0, y0, x1, y1], fill=color)
 
             # 2. Outer ring (filled 7×7)
             draw_shape(ox, oy, ox + outer - 1, oy + outer - 1, eye_color_full)
@@ -822,14 +855,18 @@ class QRBuilderApp(tk.Tk):
 
     def _load_logo(self, max_px: int) -> Image.Image:
         path = self._logo_path
+        if self._logo_cache and self._logo_cache[:2] == (path, max_px):
+            return self._logo_cache[2].copy()
         if path.lower().endswith(".svg"):
             png_bytes = cairosvg.svg2png(
                 url=path, output_width=max_px, output_height=max_px
             )
-            return Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-        logo = Image.open(path).convert("RGBA")
-        logo.thumbnail((max_px, max_px), Image.LANCZOS)
-        return logo
+            logo = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+        else:
+            logo = Image.open(path).convert("RGBA")
+            logo.thumbnail((max_px, max_px), Image.LANCZOS)
+        self._logo_cache = (path, max_px, logo)
+        return logo.copy()
 
     def _add_shaped_border(self, logo: Image.Image, pad: int, bg_rgb) -> Image.Image:
         new_w = logo.width + pad * 2
@@ -867,9 +904,7 @@ class QRBuilderApp(tk.Tk):
     def _make_bg_transparent(self, img: Image.Image, bg_rgb) -> Image.Image:
         """Replace pixels close to bg_rgb with transparent, so a bg image shows through."""
         arr = np.array(img)
-        r_t, g_t, b_t = bg_rgb[:3]
-        diff = np.abs(arr[:, :, :3].astype(np.int16) - np.array([r_t, g_t, b_t], dtype=np.int16))
-        is_bg = diff.sum(axis=2) < 40   # tolerance handles anti-aliased edges
+        is_bg = np.abs(arr[:, :, :3].astype(np.int16) - np.array(bg_rgb[:3], dtype=np.int16)).sum(axis=2) < 40
         arr[is_bg, 3] = 0
         return Image.fromarray(arr)
 
@@ -877,7 +912,12 @@ class QRBuilderApp(tk.Tk):
         if not self._bg_image_path:
             return qr_img
         try:
-            bg = Image.open(self._bg_image_path).convert("RGBA")
+            if self._bg_cache and self._bg_cache[0] == self._bg_image_path:
+                bg = self._bg_cache[1].copy()
+            else:
+                bg = Image.open(self._bg_image_path).convert("RGBA")
+                self._bg_cache = (self._bg_image_path, bg)
+                bg = bg.copy()
         except Exception as e:
             self.status_label.configure(
                 text=f"Background error: {e}", foreground="red"
@@ -922,8 +962,9 @@ class QRBuilderApp(tk.Tk):
         self._current_image = qr_img
         self._update_preview(qr_img)
         self.status_label.configure(text="Validating…", foreground="grey")
-        self._generation_id += 1
-        gen_id = self._generation_id
+        with self._generation_lock:
+            self._generation_id += 1
+            gen_id = self._generation_id
         has_logo = self._logo_path is not None
         has_bg   = self._bg_image_path is not None
         threading.Thread(
@@ -944,7 +985,9 @@ class QRBuilderApp(tk.Tk):
         try:
             arr = np.array(img.convert("RGB"))
             results = zxingcpp.read_barcodes(arr)
-            if gen_id != self._generation_id:
+            with self._generation_lock:
+                current = self._generation_id
+            if gen_id != current:
                 return  # stale — a newer generation is in flight
             if results:
                 self.after(0, lambda: self.status_label.configure(
@@ -963,9 +1006,9 @@ class QRBuilderApp(tk.Tk):
                 self.after(0, lambda m=msg: self.status_label.configure(
                     text=m, foreground="red"
                 ))
-        except Exception:
-            self.after(0, lambda: self.status_label.configure(
-                text="Ready.", foreground="grey"
+        except Exception as e:
+            self.after(0, lambda m=str(e): self.status_label.configure(
+                text=f"Scan error: {m}", foreground="red"
             ))
 
     # ═══════════════════════════════════════════════════════════ Save ══
@@ -991,7 +1034,7 @@ class QRBuilderApp(tk.Tk):
             save_img = save_img.convert("RGB")
         save_img.save(path)
         self.status_label.configure(
-            text=f"Saved: {path.split('/')[-1]}", foreground="green"
+            text=f"Saved: {os.path.basename(path)}", foreground="green"
         )
 
     def save_image_hires(self):
@@ -1009,9 +1052,10 @@ class QRBuilderApp(tk.Tk):
         img = self._current_image
         w, h = img.size
         hires = img.resize((w * 4, h * 4), Image.LANCZOS)
-        hires.convert("RGB").save(path, dpi=(300, 300))
+        save_img = hires if path.lower().endswith(".png") else hires.convert("RGB")
+        save_img.save(path, dpi=(300, 300))
         self.status_label.configure(
-            text=f"Saved hi-res: {path.split('/')[-1]}", foreground="green"
+            text=f"Saved hi-res: {os.path.basename(path)}", foreground="green"
         )
 
     def copy_to_clipboard(self):
@@ -1085,58 +1129,59 @@ class QRBuilderApp(tk.Tk):
         }
 
     def _apply_settings_dict(self, d: dict):
-        self.qr_type_var.set(d.get("qr_type", "URL / Text"))
-        self.url_var.set(d.get("url", ""))
-        self.wifi_ssid_var.set(d.get("wifi_ssid", ""))
-        self.wifi_pass_var.set(d.get("wifi_pass", ""))
-        self.wifi_sec_var.set(d.get("wifi_sec", "WPA"))
-        self.contact_name_var.set(d.get("contact_name", ""))
-        self.contact_phone_var.set(d.get("contact_phone", ""))
-        self.contact_email_var.set(d.get("contact_email", ""))
-        self.email_to_var.set(d.get("email_to", ""))
-        self.email_subject_var.set(d.get("email_subject", ""))
-        self.email_body_var.set(d.get("email_body", ""))
-        self.sms_number_var.set(d.get("sms_number", ""))
-        self.sms_body_var.set(d.get("sms_body", ""))
-        self.phone_var.set(d.get("phone", ""))
-        self.ec_var.set(d.get("ec", "Q"))
-        self.shape_var.set(d.get("shape", "Square"))
-        self.bg_var.set(d.get("bg", "#FFFFFF"))
-        self.fg_var.set(d.get("fg", "#000000"))
-        self.fg2_var.set(d.get("fg2", "#0055FF"))
-        self.gradient_var.set(d.get("gradient", "None"))
-        self.eye_shape_var.set(d.get("eye_shape", "Square"))
-        self.eye_color_var.set(d.get("eye_color", "#000000"))
-        self.border_var.set(d.get("border", 4))
-        self.border_label.configure(text=str(d.get("border", 4)))
-        self.logo_size_var.set(d.get("logo_size", 25))
-        self.logo_size_label.configure(text=f"{d.get('logo_size', 25)}%")
-        self.logo_pad_var.set(d.get("logo_pad", 8))
-        self.logo_pad_label.configure(text=f"{d.get('logo_pad', 8)} px")
-        lp = d.get("logo_path", "")
+        s = {**DEFAULT_SETTINGS, **d}  # d overrides defaults
+        self.qr_type_var.set(s["qr_type"])
+        self.url_var.set(s["url"])
+        self.wifi_ssid_var.set(s["wifi_ssid"])
+        self.wifi_pass_var.set(s["wifi_pass"])
+        self.wifi_sec_var.set(s["wifi_sec"])
+        self.contact_name_var.set(s["contact_name"])
+        self.contact_phone_var.set(s["contact_phone"])
+        self.contact_email_var.set(s["contact_email"])
+        self.email_to_var.set(s["email_to"])
+        self.email_subject_var.set(s["email_subject"])
+        self.email_body_var.set(s["email_body"])
+        self.sms_number_var.set(s["sms_number"])
+        self.sms_body_var.set(s["sms_body"])
+        self.phone_var.set(s["phone"])
+        self.ec_var.set(s["ec"])
+        self.shape_var.set(s["shape"])
+        self.bg_var.set(s["bg"])
+        self.fg_var.set(s["fg"])
+        self.fg2_var.set(s["fg2"])
+        self.gradient_var.set(s["gradient"])
+        self.eye_shape_var.set(s["eye_shape"])
+        self.eye_color_var.set(s["eye_color"])
+        self.border_var.set(s["border"])
+        self.border_label.configure(text=str(s["border"]))
+        self.logo_size_var.set(s["logo_size"])
+        self.logo_size_label.configure(text=f"{s['logo_size']}%")
+        self.logo_pad_var.set(s["logo_pad"])
+        self.logo_pad_label.configure(text=f"{s['logo_pad']} px")
+        lp = s["logo_path"]
         if lp and not os.path.exists(lp):
             self.status_label.configure(
-                text=f"Logo not found: {lp.split('/')[-1]}", foreground="orange"
+                text=f"Logo not found: {os.path.basename(lp)}", foreground="orange"
             )
             lp = ""
         self._logo_path = lp or None
         self.logo_label.configure(
-            text=lp.split("/")[-1] if lp else "None",
+            text=os.path.basename(lp) if lp else "None",
             foreground="black" if lp else "grey"
         )
-        bp = d.get("bg_image_path", "")
+        bp = s["bg_image_path"]
         if bp and not os.path.exists(bp):
             self.status_label.configure(
-                text=f"Background image not found: {bp.split('/')[-1]}", foreground="orange"
+                text=f"Background image not found: {os.path.basename(bp)}", foreground="orange"
             )
             bp = ""
         self._bg_image_path = bp or None
         self.bg_image_label.configure(
-            text=bp.split("/")[-1] if bp else "None",
+            text=os.path.basename(bp) if bp else "None",
             foreground="black" if bp else "grey"
         )
-        self.bg_opacity_var.set(d.get("bg_opacity", 30))
-        self.bg_opacity_label.configure(text=f"{d.get('bg_opacity', 30)}%")
+        self.bg_opacity_var.set(s["bg_opacity"])
+        self.bg_opacity_label.configure(text=f"{s['bg_opacity']}%")
         self._show_type_fields()
 
     @staticmethod
@@ -1185,6 +1230,9 @@ class QRBuilderApp(tk.Tk):
         if not name:
             return
         path = os.path.join(PRESETS_DIR, f"{name}.json")
+        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR)):
+            messagebox.showerror("Error", "Invalid preset name.")
+            return
         if not os.path.exists(path):
             messagebox.showerror("Not found", f"Preset '{name}' not found.")
             return
@@ -1200,6 +1248,9 @@ class QRBuilderApp(tk.Tk):
         if not messagebox.askyesno("Delete", f"Delete preset '{name}'?"):
             return
         path = os.path.join(PRESETS_DIR, f"{name}.json")
+        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR)):
+            messagebox.showerror("Error", "Invalid preset name.")
+            return
         if os.path.exists(path):
             os.unlink(path)
         self._refresh_preset_list()
@@ -1212,6 +1263,7 @@ class QRBuilderApp(tk.Tk):
     def _reset(self):
         if not messagebox.askyesno("Reset", "Clear all settings and start fresh?"):
             return
+        self._wifi_warn_shown = False
         self._apply_settings_dict({})
         self._notebook.select(0)
         self._on_change()
@@ -1223,15 +1275,15 @@ class QRBuilderApp(tk.Tk):
             with open(self._SESSION_FILE) as f:
                 d = json.load(f)
             self._apply_settings_dict(d)
-        except Exception:
-            pass  # corrupt session file — start fresh silently
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass  # corrupt or missing session file — start fresh silently
 
     def _on_close(self):
         try:
             os.makedirs(os.path.dirname(self._SESSION_FILE), exist_ok=True)
             with open(self._SESSION_FILE, "w") as f:
                 json.dump(self._settings_dict(), f, indent=2)
-        except Exception:
+        except OSError:
             pass
         self.destroy()
 
