@@ -920,8 +920,12 @@ class QRBuilderApp(tk.Tk):
         self.status_label.configure(text="Validating…", foreground="grey")
         self._generation_id += 1
         gen_id = self._generation_id
+        has_logo = self._logo_path is not None
+        has_bg   = self._bg_image_path is not None
         threading.Thread(
-            target=self._validate_scan, args=(qr_img.copy(), gen_id), daemon=True
+            target=self._validate_scan,
+            args=(qr_img.copy(), gen_id, has_logo, has_bg),
+            daemon=True
         ).start()
 
     def _update_preview(self, img: Image.Image):
@@ -932,20 +936,28 @@ class QRBuilderApp(tk.Tk):
 
     # ═══════════════════════════════════════════════ Scan validation ══
 
-    def _validate_scan(self, img: Image.Image, gen_id: int):
+    def _validate_scan(self, img: Image.Image, gen_id: int, has_logo: bool, has_bg: bool):
         try:
             arr = np.array(img.convert("RGB"))
             results = zxingcpp.read_barcodes(arr)
             if gen_id != self._generation_id:
-                return  # stale result — a newer generation is in flight
+                return  # stale — a newer generation is in flight
             if results:
                 self.after(0, lambda: self.status_label.configure(
                     text="✓ Scannable", foreground="green"
                 ))
             else:
-                self.after(0, lambda: self.status_label.configure(
-                    text="⚠ Not scannable — reduce logo size or raise error correction",
-                    foreground="red"
+                if has_logo and has_bg:
+                    hint = "reduce logo size, lower background opacity, or raise error correction"
+                elif has_logo:
+                    hint = "reduce logo size or raise error correction"
+                elif has_bg:
+                    hint = "lower background opacity or raise error correction"
+                else:
+                    hint = "raise error correction level"
+                msg = f"⚠ Not scannable — {hint}"
+                self.after(0, lambda m=msg: self.status_label.configure(
+                    text=m, foreground="red"
                 ))
         except Exception:
             self.after(0, lambda: self.status_label.configure(
