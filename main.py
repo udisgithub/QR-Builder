@@ -7,6 +7,8 @@ Run:  python main.py
 import io
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -77,8 +79,8 @@ PREVIEW_SIZE = 420
 class QRBuilderApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("QR Code Builder")
-        self.resizable(False, False)
+        self.title("QR Code Builder — Private & Offline")
+        self.minsize(700, 560)
 
         # Internal state
         self._debounce_id = None
@@ -86,6 +88,8 @@ class QRBuilderApp(tk.Tk):
         self._current_image: Image.Image | None = None
         self._logo_path: str | None = None
         self._bg_image_path: str | None = None
+        self._generation_id = 0
+        self._wifi_warn_shown = False
 
         # ── Content vars ──────────────────────────────────────────────────
         self.qr_type_var = tk.StringVar(value="URL / Text")
@@ -129,6 +133,8 @@ class QRBuilderApp(tk.Tk):
 
         self._build_ui()
         self._bind_events()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._restore_session()
         self.after(100, self.generate_qr)
 
     # ═══════════════════════════════════════════════════════════════════ UI ══
@@ -152,6 +158,7 @@ class QRBuilderApp(tk.Tk):
         self._build_style_tab(style_tab)
         self._build_logo_tab(logo_tab)
         self._build_output_tab(output_tab)
+        self._build_menu()
 
         # ── Separator ─────────────────────────────────────────────────────
         ttk.Separator(self, orient="vertical").grid(
@@ -160,6 +167,18 @@ class QRBuilderApp(tk.Tk):
 
         # ── Right panel ───────────────────────────────────────────────────
         self._build_right_panel()
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Save…", accelerator="Cmd+S", command=self.save_image)
+        file_menu.add_command(label="Save Hi-Res…", command=self.save_image_hires)
+        file_menu.add_command(label="Copy to Clipboard", accelerator="Cmd+C", command=self.copy_to_clipboard)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.configure(menu=menubar)
+        mod = "Command" if sys.platform == "darwin" else "Control"
+        self.bind_all(f"<{mod}-s>", lambda _: self.save_image())
+        self.bind_all(f"<{mod}-c>", lambda _: self.copy_to_clipboard())
 
     # ── Content tab ───────────────────────────────────────────────────────
 
@@ -186,16 +205,20 @@ class QRBuilderApp(tk.Tk):
         ttk.Separator(parent, orient="horizontal").grid(
             row=3, column=0, columnspan=3, sticky="ew", pady=6
         )
-        ttk.Label(parent, text="Error Correction", font=("", 9, "bold")).grid(
+        ttk.Label(parent, text="Damage Resistance", font=("", 9, "bold")).grid(
             row=4, column=0, columnspan=3, sticky="w", **pad
         )
         ec_frame = ttk.Frame(parent)
         ec_frame.grid(row=5, column=0, columnspan=3, sticky="w", padx=8)
-        for i, level in enumerate(("L", "M", "Q", "H")):
+        for i, (level, tip) in enumerate([("L","Low"),("M","Med"),("Q","High"),("H","Max")]):
             ttk.Radiobutton(
-                ec_frame, text=level, variable=self.ec_var, value=level,
+                ec_frame, text=f"{level} ({tip})", variable=self.ec_var, value=level,
                 command=self._on_change
-            ).grid(row=0, column=i, padx=6)
+            ).grid(row=0, column=i, padx=4)
+        ttk.Label(parent, text="Use High or Max when adding a logo.",
+                  foreground="grey", font=("", 8)).grid(
+            row=6, column=0, columnspan=3, sticky="w", padx=8
+        )
 
         self._show_type_fields()
 
@@ -302,7 +325,7 @@ class QRBuilderApp(tk.Tk):
         row = 0
 
         # Module shape
-        ttk.Label(parent, text="Module Shape", font=("", 9, "bold")).grid(
+        ttk.Label(parent, text="Dot Shape", font=("", 9, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", **pad
         ); row += 1
         self.shape_combo = ttk.Combobox(
@@ -331,7 +354,7 @@ class QRBuilderApp(tk.Tk):
         row += 1
 
         # Foreground color
-        ttk.Label(parent, text="Module Color", font=("", 9, "bold")).grid(
+        ttk.Label(parent, text="QR Dot Color", font=("", 9, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", **pad
         ); row += 1
         self.fg_entry = ttk.Entry(parent, textvariable=self.fg_var, width=10)
@@ -400,7 +423,7 @@ class QRBuilderApp(tk.Tk):
         ); row += 1
 
         # Quiet zone
-        ttk.Label(parent, text="Quiet Zone (border modules)", font=("", 9, "bold")).grid(
+        ttk.Label(parent, text="White Border Width", font=("", 9, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", **pad
         ); row += 1
         border_frame = ttk.Frame(parent)
@@ -528,28 +551,31 @@ class QRBuilderApp(tk.Tk):
         right.grid(row=0, column=2, sticky="nsew")
 
         ttk.Label(right, text="Preview", font=("", 9, "bold")).grid(
-            row=0, column=0, columnspan=2
+            row=0, column=0, columnspan=3
         )
 
         self.preview_label = ttk.Label(
             right, relief="sunken", width=PREVIEW_SIZE, anchor="center"
         )
         self.preview_label.grid(
-            row=1, column=0, columnspan=2, padx=8, pady=8, ipadx=4, ipady=4
+            row=1, column=0, columnspan=3, padx=8, pady=8, ipadx=4, ipady=4
         )
         placeholder = tk.PhotoImage(width=PREVIEW_SIZE, height=PREVIEW_SIZE)
         self.preview_label.configure(image=placeholder)
         self._placeholder = placeholder
 
-        ttk.Button(right, text="Copy", command=self.copy_to_clipboard, width=12).grid(
-            row=2, column=0, padx=8, pady=8
+        ttk.Button(right, text="Copy", command=self.copy_to_clipboard, width=10).grid(
+            row=2, column=0, padx=4, pady=8
         )
-        ttk.Button(right, text="Save…", command=self.save_image, width=12).grid(
-            row=2, column=1, padx=8, pady=8
+        ttk.Button(right, text="Save…", command=self.save_image, width=10).grid(
+            row=2, column=1, padx=4, pady=8
+        )
+        ttk.Button(right, text="Save Hi-Res…", command=self.save_image_hires, width=12).grid(
+            row=2, column=2, padx=4, pady=8
         )
 
         self.status_label = ttk.Label(right, text="", foreground="grey")
-        self.status_label.grid(row=3, column=0, columnspan=2)
+        self.status_label.grid(row=3, column=0, columnspan=3)
 
     # ═══════════════════════════════════════════════════════════════ Events ══
 
@@ -892,8 +918,14 @@ class QRBuilderApp(tk.Tk):
         self._current_image = qr_img
         self._update_preview(qr_img)
         self.status_label.configure(text="Validating…", foreground="grey")
+        self._generation_id += 1
+        gen_id = self._generation_id
+        has_logo = self._logo_path is not None
+        has_bg   = self._bg_image_path is not None
         threading.Thread(
-            target=self._validate_scan, args=(qr_img.copy(),), daemon=True
+            target=self._validate_scan,
+            args=(qr_img.copy(), gen_id, has_logo, has_bg),
+            daemon=True
         ).start()
 
     def _update_preview(self, img: Image.Image):
@@ -904,18 +936,28 @@ class QRBuilderApp(tk.Tk):
 
     # ═══════════════════════════════════════════════ Scan validation ══
 
-    def _validate_scan(self, img: Image.Image):
+    def _validate_scan(self, img: Image.Image, gen_id: int, has_logo: bool, has_bg: bool):
         try:
             arr = np.array(img.convert("RGB"))
             results = zxingcpp.read_barcodes(arr)
+            if gen_id != self._generation_id:
+                return  # stale — a newer generation is in flight
             if results:
                 self.after(0, lambda: self.status_label.configure(
                     text="✓ Scannable", foreground="green"
                 ))
             else:
-                self.after(0, lambda: self.status_label.configure(
-                    text="⚠ Not scannable — reduce logo size or raise error correction",
-                    foreground="red"
+                if has_logo and has_bg:
+                    hint = "reduce logo size, lower background opacity, or raise error correction"
+                elif has_logo:
+                    hint = "reduce logo size or raise error correction"
+                elif has_bg:
+                    hint = "lower background opacity or raise error correction"
+                else:
+                    hint = "raise error correction level"
+                msg = f"⚠ Not scannable — {hint}"
+                self.after(0, lambda m=msg: self.status_label.configure(
+                    text=m, foreground="red"
                 ))
         except Exception:
             self.after(0, lambda: self.status_label.configure(
@@ -933,36 +975,39 @@ class QRBuilderApp(tk.Tk):
             defaultextension=".png",
             filetypes=[
                 ("PNG Image", "*.png"),
-                ("SVG Vector", "*.svg"),
+                ("High-Resolution PNG (4x)", "*.png"),
                 ("JPEG Image", "*.jpg"),
                 ("All Files", "*.*"),
             ],
         )
         if not path:
             return
-        if path.lower().endswith(".svg"):
-            self._save_svg(path)
-        else:
-            save_img = self._current_image
-            if path.lower().endswith((".jpg", ".jpeg")):
-                save_img = save_img.convert("RGB")
-            save_img.save(path)
-            self.status_label.configure(
-                text=f"Saved: {path.split('/')[-1]}", foreground="green"
-            )
-
-    def _save_svg(self, path: str):
-        from qrcode.image.svg import SvgImage
-        text = self._build_content_string()
-        ec = EC_LEVELS[self.ec_var.get()]
-        border = int(self.border_var.get())
-        qr = qrcode.QRCode(error_correction=ec, border=border)
-        qr.add_data(text)
-        qr.make(fit=True)
-        img = qr.make_image(image_factory=SvgImage)
-        img.save(path)
+        save_img = self._current_image
+        if path.lower().endswith((".jpg", ".jpeg")):
+            save_img = save_img.convert("RGB")
+        save_img.save(path)
         self.status_label.configure(
             text=f"Saved: {path.split('/')[-1]}", foreground="green"
+        )
+
+    def save_image_hires(self):
+        """Save a 4x upscaled version for print production."""
+        if self._current_image is None:
+            messagebox.showwarning("Nothing to save", "Generate a QR code first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save High-Resolution QR Code",
+            defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        img = self._current_image
+        w, h = img.size
+        hires = img.resize((w * 4, h * 4), Image.LANCZOS)
+        hires.convert("RGB").save(path, dpi=(300, 300))
+        self.status_label.configure(
+            text=f"Saved hi-res: {path.split('/')[-1]}", foreground="green"
         )
 
     def copy_to_clipboard(self):
@@ -970,15 +1015,18 @@ class QRBuilderApp(tk.Tk):
             messagebox.showwarning("Nothing to copy", "Generate a QR code first.")
             return
         if sys.platform == "darwin":
-            tmp = tempfile.mktemp(suffix=".png")
-            self._current_image.convert("RGB").save(tmp)
-            subprocess.run(
-                ["osascript", "-e",
-                 f'set the clipboard to (read (POSIX file "{tmp}") as TIFF picture)'],
-                check=True
-            )
-            os.unlink(tmp)
-            self.status_label.configure(text="Copied to clipboard.", foreground="green")
+            fd, tmp = tempfile.mkstemp(suffix=".png")
+            try:
+                os.close(fd)
+                self._current_image.convert("RGB").save(tmp)
+                subprocess.run(
+                    ["osascript", "-e",
+                     f"set the clipboard to (read (POSIX file {shlex.quote(tmp)}) as TIFF picture)"],
+                    check=True
+                )
+                self.status_label.configure(text="Copied to clipboard.", foreground="green")
+            finally:
+                os.unlink(tmp)
         else:
             messagebox.showinfo(
                 "Not supported",
@@ -1062,12 +1110,22 @@ class QRBuilderApp(tk.Tk):
         self.logo_pad_var.set(d.get("logo_pad", 8))
         self.logo_pad_label.configure(text=f"{d.get('logo_pad', 8)} px")
         lp = d.get("logo_path", "")
+        if lp and not os.path.exists(lp):
+            self.status_label.configure(
+                text=f"Logo not found: {lp.split('/')[-1]}", foreground="orange"
+            )
+            lp = ""
         self._logo_path = lp or None
         self.logo_label.configure(
             text=lp.split("/")[-1] if lp else "None",
             foreground="black" if lp else "grey"
         )
         bp = d.get("bg_image_path", "")
+        if bp and not os.path.exists(bp):
+            self.status_label.configure(
+                text=f"Background image not found: {bp.split('/')[-1]}", foreground="orange"
+            )
+            bp = ""
         self._bg_image_path = bp or None
         self.bg_image_label.configure(
             text=bp.split("/")[-1] if bp else "None",
@@ -1077,12 +1135,41 @@ class QRBuilderApp(tk.Tk):
         self.bg_opacity_label.configure(text=f"{d.get('bg_opacity', 30)}%")
         self._show_type_fields()
 
+    @staticmethod
+    def _sanitize_preset_name(name: str) -> str:
+        """Allow only alphanumeric, spaces, hyphens, underscores."""
+        return re.sub(r"[^\w\s\-]", "", name).strip()
+
     def _save_preset(self):
-        name = simpledialog.askstring("Save Preset", "Preset name:")
+        raw = simpledialog.askstring("Save Preset", "Preset name:")
+        if not raw:
+            return
+        name = self._sanitize_preset_name(raw)
         if not name:
+            messagebox.showerror(
+                "Invalid name",
+                "Preset name may only contain letters, numbers, spaces, hyphens, and underscores."
+            )
             return
         os.makedirs(PRESETS_DIR, exist_ok=True)
         path = os.path.join(PRESETS_DIR, f"{name}.json")
+        # Verify the resolved path stays within PRESETS_DIR (path traversal guard)
+        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR)):
+            messagebox.showerror("Error", "Invalid preset name.")
+            return
+        # P0-3: warn before storing plaintext WiFi password
+        if (self.qr_type_var.get() == "WiFi"
+                and self.wifi_pass_var.get()
+                and not self._wifi_warn_shown):
+            proceed = messagebox.askyesno(
+                "WiFi Password Warning",
+                f"This preset will save your WiFi password in plain text at:\n"
+                f"{path}\n\n"
+                "Only save if you are comfortable with this. Continue?"
+            )
+            if not proceed:
+                return
+            self._wifi_warn_shown = True
         with open(path, "w") as f:
             json.dump(self._settings_dict(), f, indent=2)
         self._refresh_preset_list()
@@ -1113,6 +1200,29 @@ class QRBuilderApp(tk.Tk):
             os.unlink(path)
         self._refresh_preset_list()
         self.status_label.configure(text=f"Preset '{name}' deleted.", foreground="grey")
+
+    # ══════════════════════════════════════════════════ Session restore ══
+
+    _SESSION_FILE = os.path.join(os.path.expanduser("~/.qrbuilder"), "last_session.json")
+
+    def _restore_session(self):
+        if not os.path.exists(self._SESSION_FILE):
+            return
+        try:
+            with open(self._SESSION_FILE) as f:
+                d = json.load(f)
+            self._apply_settings_dict(d)
+        except Exception:
+            pass  # corrupt session file — start fresh silently
+
+    def _on_close(self):
+        try:
+            os.makedirs(os.path.dirname(self._SESSION_FILE), exist_ok=True)
+            with open(self._SESSION_FILE, "w") as f:
+                json.dump(self._settings_dict(), f, indent=2)
+        except Exception:
+            pass
+        self.destroy()
 
 
 if __name__ == "__main__":
