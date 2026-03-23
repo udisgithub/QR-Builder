@@ -1,0 +1,5 @@
+qrcode[pil]>=7.4
+Pillow>=10.0
+cairosvg>=2.7
+zxing-cpp>=2.0
+numpy>=1.24
