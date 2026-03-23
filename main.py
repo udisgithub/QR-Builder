@@ -577,6 +577,10 @@ class QRBuilderApp(tk.Tk):
         self.status_label = ttk.Label(right, text="", foreground="grey")
         self.status_label.grid(row=3, column=0, columnspan=3)
 
+        ttk.Button(right, text="Reset to Defaults", command=self._reset, width=16).grid(
+            row=4, column=0, columnspan=3, pady=(8, 0)
+        )
+
     # ═══════════════════════════════════════════════════════════════ Events ══
 
     def _bind_events(self):
@@ -1204,6 +1208,13 @@ class QRBuilderApp(tk.Tk):
     # ══════════════════════════════════════════════════ Session restore ══
 
     _SESSION_FILE = os.path.join(os.path.expanduser("~/.qrbuilder"), "last_session.json")
+
+    def _reset(self):
+        if not messagebox.askyesno("Reset", "Clear all settings and start fresh?"):
+            return
+        self._apply_settings_dict({})
+        self._notebook.select(0)
+        self._on_change()
 
     def _restore_session(self):
         if not os.path.exists(self._SESSION_FILE):
