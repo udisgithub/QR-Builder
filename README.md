@@ -1,6 +1,6 @@
 # QR Builder
 
-A local desktop app for generating styled QR codes with full visual customisation. No internet connection required — everything runs on your machine.
+A free local desktop app for generating styled QR codes with full visual customisation. No internet connection required — everything runs on your machine.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -29,7 +29,7 @@ A local desktop app for generating styled QR codes with full visual customisatio
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/qr-builder.git
+git clone https://github.com/udisgithub/qr-builder.git
 cd qr-builder
 python3 -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate

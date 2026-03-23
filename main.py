@@ -336,16 +336,17 @@ class QRBuilderApp(tk.Tk):
             e = self._escape_mecard(self.contact_email_var.get())
             return f"MECARD:N:{n};TEL:{p};EMAIL:{e};;"
         elif t == "Email":
-            to   = self.email_to_var.get()
+            to   = urllib.parse.quote(self.email_to_var.get(), safe="@.")
             subj = urllib.parse.quote(self.email_subject_var.get())
             body = urllib.parse.quote(self.email_body_var.get())
             return f"mailto:{to}?subject={subj}&body={body}"
         elif t == "SMS":
-            number = self.sms_number_var.get()
+            number = re.sub(r"[^\d+\-() ]", "", self.sms_number_var.get())
             body   = urllib.parse.quote(self.sms_body_var.get())
             return f"smsto:{number}:{body}"
         elif t == "Phone":
-            return f"tel:{self.phone_var.get()}"
+            number = re.sub(r"[^\d+\-() ]", "", self.phone_var.get())
+            return f"tel:{number}"
         return "https://example.com"
 
     # ── Style tab ─────────────────────────────────────────────────────────
@@ -615,8 +616,8 @@ class QRBuilderApp(tk.Tk):
 
     def _bind_events(self):
         self.url_var.trace_add("write", lambda *_: self._on_change())
-        self.wifi_ssid_var.trace_add("write", lambda *_: self._on_change())
-        self.wifi_pass_var.trace_add("write", lambda *_: self._on_change())
+        self.wifi_ssid_var.trace_add("write", lambda *_: self._on_wifi_credential_change())
+        self.wifi_pass_var.trace_add("write", lambda *_: self._on_wifi_credential_change())
         self.wifi_sec_var.trace_add("write", lambda *_: self._on_change())
         self.contact_name_var.trace_add("write", lambda *_: self._on_change())
         self.contact_phone_var.trace_add("write", lambda *_: self._on_change())
@@ -640,6 +641,10 @@ class QRBuilderApp(tk.Tk):
         if self._debounce_id:
             self.after_cancel(self._debounce_id)
         self._debounce_id = self.after(300, self.generate_qr)
+
+    def _on_wifi_credential_change(self):
+        self._wifi_warn_shown = False
+        self._on_change()
 
     def _on_type_change(self, _event=None):
         self._show_type_fields()
@@ -858,6 +863,10 @@ class QRBuilderApp(tk.Tk):
         if self._logo_cache and self._logo_cache[:2] == (path, max_px):
             return self._logo_cache[2].copy()
         if path.lower().endswith(".svg"):
+            # Security: cairosvg may follow xlink:href / CSS url() references inside
+            # the SVG. path is always a file chosen by the user via the OS file picker,
+            # so no remote-supply path exists. Users should avoid opening SVGs from
+            # untrusted sources as logos.
             png_bytes = cairosvg.svg2png(
                 url=path, output_width=max_px, output_height=max_px
             )
@@ -1065,8 +1074,14 @@ class QRBuilderApp(tk.Tk):
         if sys.platform == "darwin":
             fd, tmp = tempfile.mkstemp(suffix=".png")
             try:
-                os.close(fd)
-                self._current_image.convert("RGB").save(tmp)
+                # Write through the fd returned by mkstemp — avoids closing and
+                # re-opening by path, which would create a TOCTOU window.
+                # tmp is always a mkstemp-generated path; never pass user-supplied
+                # paths here (shlex.quote inside AppleScript has POSIX-shell semantics
+                # only, not AppleScript string semantics).
+                with os.fdopen(fd, "wb") as fh:
+                    self._current_image.convert("RGB").save(fh, format="PNG")
+                fd = -1  # ownership transferred to fdopen; don't double-close
                 subprocess.run(
                     ["osascript", "-e",
                      f"set the clipboard to (read (POSIX file {shlex.quote(tmp)}) as TIFF picture)"],
@@ -1074,7 +1089,10 @@ class QRBuilderApp(tk.Tk):
                 )
                 self.status_label.configure(text="Copied to clipboard.", foreground="green")
             finally:
-                os.unlink(tmp)
+                if fd != -1:
+                    os.close(fd)
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
         else:
             messagebox.showinfo(
                 "Not supported",
@@ -1185,6 +1203,32 @@ class QRBuilderApp(tk.Tk):
         self._show_type_fields()
 
     @staticmethod
+    def _sanitize_loaded_settings(d: dict) -> dict:
+        """Validate enum fields from loaded JSON against allowed values.
+        Unknown values are replaced with the DEFAULT_SETTINGS fallback so a
+        tampered preset cannot crash the app via a bad dict-key lookup."""
+        _ALLOWED = {
+            "qr_type":    set(QR_TYPES),
+            "ec":         set(EC_LEVELS),
+            "shape":      set(SHAPE_DRAWERS),
+            "gradient":   set(GRADIENT_TYPES),
+            "eye_shape":  set(EYE_SHAPES),
+            "wifi_sec":   {"WPA", "WEP", "nopass"},
+        }
+        out = dict(d)
+        for key, allowed in _ALLOWED.items():
+            if out.get(key) not in allowed:
+                out[key] = DEFAULT_SETTINGS[key]
+        # Ensure numeric fields are within sane bounds
+        for key, lo, hi in [("border", 0, 20), ("logo_size", 5, 50),
+                             ("logo_pad", 0, 40), ("bg_opacity", 0, 100)]:
+            try:
+                out[key] = max(lo, min(hi, int(out[key])))
+            except (KeyError, TypeError, ValueError):
+                out[key] = DEFAULT_SETTINGS[key]
+        return out
+
+    @staticmethod
     def _sanitize_preset_name(name: str) -> str:
         """Allow only alphanumeric, spaces, hyphens, underscores."""
         return re.sub(r"[^\w\s\-]", "", name).strip()
@@ -1200,10 +1244,16 @@ class QRBuilderApp(tk.Tk):
                 "Preset name may only contain letters, numbers, spaces, hyphens, and underscores."
             )
             return
+        if name != raw.strip():
+            if not messagebox.askyesno(
+                "Name adjusted",
+                f"Some characters were removed. Save as '{name}'?"
+            ):
+                return
         os.makedirs(PRESETS_DIR, exist_ok=True)
         path = os.path.join(PRESETS_DIR, f"{name}.json")
         # Verify the resolved path stays within PRESETS_DIR (path traversal guard)
-        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR)):
+        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR) + os.sep):
             messagebox.showerror("Error", "Invalid preset name.")
             return
         # P0-3: warn before storing plaintext WiFi password
@@ -1230,7 +1280,7 @@ class QRBuilderApp(tk.Tk):
         if not name:
             return
         path = os.path.join(PRESETS_DIR, f"{name}.json")
-        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR)):
+        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR) + os.sep):
             messagebox.showerror("Error", "Invalid preset name.")
             return
         if not os.path.exists(path):
@@ -1238,7 +1288,7 @@ class QRBuilderApp(tk.Tk):
             return
         with open(path) as f:
             d = json.load(f)
-        self._apply_settings_dict(d)
+        self._apply_settings_dict(self._sanitize_loaded_settings(d))
         self.generate_qr()
 
     def _delete_preset(self):
@@ -1248,7 +1298,7 @@ class QRBuilderApp(tk.Tk):
         if not messagebox.askyesno("Delete", f"Delete preset '{name}'?"):
             return
         path = os.path.join(PRESETS_DIR, f"{name}.json")
-        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR)):
+        if not os.path.realpath(path).startswith(os.path.realpath(PRESETS_DIR) + os.sep):
             messagebox.showerror("Error", "Invalid preset name.")
             return
         if os.path.exists(path):
@@ -1274,15 +1324,17 @@ class QRBuilderApp(tk.Tk):
         try:
             with open(self._SESSION_FILE) as f:
                 d = json.load(f)
-            self._apply_settings_dict(d)
+            self._apply_settings_dict(self._sanitize_loaded_settings(d))
         except (OSError, json.JSONDecodeError, ValueError):
             pass  # corrupt or missing session file — start fresh silently
 
     def _on_close(self):
         try:
             os.makedirs(os.path.dirname(self._SESSION_FILE), exist_ok=True)
+            session = self._settings_dict()
+            session["wifi_pass"] = ""  # never persist WiFi password without explicit consent
             with open(self._SESSION_FILE, "w") as f:
-                json.dump(self._settings_dict(), f, indent=2)
+                json.dump(session, f, indent=2)
         except OSError:
             pass
         self.destroy()
