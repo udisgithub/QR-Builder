@@ -1,4 +1,29 @@
+# Virtual environment
 .venv/
+venv/
+env/
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Exported images
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# macOS
 .DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Presets are stored per-user in ~/.qrbuilder/
+CLAUDE.md
